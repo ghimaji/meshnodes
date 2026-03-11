@@ -31,8 +31,10 @@
 class MeshNode {
 private:
     struct Peer {
+        std::string nodeId;
         std::string address;
         int port;
+        int listenPort;  // The port this peer is listening on
         SOCKET socket;
         bool connected;
         bool authenticated;
@@ -127,7 +129,7 @@ private:
         }
     }
 
-    bool authenticatePeer(SOCKET socket) {
+    bool authenticatePeer(SOCKET socket, std::string& peerNodeId, int& peerListenPort) {
         // Wait for AUTH message
         char buffer[1024];
         memset(buffer, 0, sizeof(buffer));
@@ -147,14 +149,25 @@ private:
         
         std::string message(buffer, bytesReceived);
         
-        // Expected format: AUTH:<password_hash>
+        // Expected format: AUTH:<password_hash>:<node_id>:<listen_port>
         if (message.find("AUTH:") == 0) {
-            std::string receivedHash = message.substr(5);
+            size_t pos1 = 5;  // After "AUTH:"
+            size_t pos2 = message.find(':', pos1);
+            size_t pos3 = message.find(':', pos2 + 1);
+            
+            if (pos2 == std::string::npos || pos3 == std::string::npos) {
+                std::cout << "[" << nodeId << "] Invalid authentication format" << std::endl;
+                return false;
+            }
+            
+            std::string receivedHash = message.substr(pos1, pos2 - pos1);
+            peerNodeId = message.substr(pos2 + 1, pos3 - pos2 - 1);
+            peerListenPort = std::stoi(message.substr(pos3 + 1));
             
             if (receivedHash == passwordHash) {
-                std::string response = "AUTH_OK:" + nodeId;
+                std::string response = "AUTH_OK:" + nodeId + ":" + std::to_string(listenPort);
                 send(socket, response.c_str(), response.length(), 0);
-                std::cout << "[" << nodeId << "] Peer authenticated successfully" << std::endl;
+                std::cout << "[" << nodeId << "] Peer " << peerNodeId << " authenticated successfully" << std::endl;
                 return true;
             } else {
                 std::string response = "AUTH_FAIL";
@@ -169,17 +182,47 @@ private:
     }
 
     void handleIncomingPeer(SOCKET socket, const std::string& address) {
+        std::string peerNodeId;
+        int peerListenPort;
+        
         // Authenticate the peer first
-        if (!authenticatePeer(socket)) {
+        if (!authenticatePeer(socket, peerNodeId, peerListenPort)) {
             closesocket(socket);
             return;
         }
         
+        // Register the peer with their listen port for bidirectional communication
+        {
+            std::lock_guard<std::mutex> lock(peersMutex);
+            std::string peerId = peerNodeId;
+            
+            // Check if we already have a connection to this peer
+            if (peers.find(peerId) != peers.end() && peers[peerId].connected) {
+                std::cout << "[" << nodeId << "] Already have a connection to " << peerNodeId << std::endl;
+                closesocket(socket);
+                return;
+            }
+            
+            Peer peer;
+            peer.nodeId = peerNodeId;
+            peer.address = address;
+            peer.port = 0;  // Unknown outgoing port
+            peer.listenPort = peerListenPort;
+            peer.socket = socket;
+            peer.connected = true;
+            peer.authenticated = true;
+            peer.lastSeen = time(nullptr);
+            
+            peers[peerId] = peer;
+            std::cout << "[" << nodeId << "] Registered bidirectional peer: " << peerNodeId 
+                      << " (listening on " << peerListenPort << ")" << std::endl;
+        }
+        
         // If authenticated, handle the connection normally
-        handlePeerConnection(socket, address, true);
+        handlePeerConnection(socket, address, peerNodeId, true);
     }
 
-    void handlePeerConnection(SOCKET socket, const std::string& address, bool authenticated = false) {
+    void handlePeerConnection(SOCKET socket, const std::string& address, const std::string& peerNodeId, bool authenticated = false) {
         char buffer[1024];
         
         while (running) {
@@ -187,12 +230,18 @@ private:
             int bytesReceived = recv(socket, buffer, sizeof(buffer) - 1, 0);
             
             if (bytesReceived <= 0) {
-                std::cout << "[" << nodeId << "] Connection closed with " << address << std::endl;
+                std::cout << "[" << nodeId << "] Connection closed with " << peerNodeId << " (" << address << ")" << std::endl;
+                
+                // Mark peer as disconnected
+                std::lock_guard<std::mutex> lock(peersMutex);
+                if (peers.find(peerNodeId) != peers.end()) {
+                    peers[peerNodeId].connected = false;
+                }
                 break;
             }
             
             std::string message(buffer, bytesReceived);
-            std::cout << "[" << nodeId << "] Received from " << address << ": " << message << std::endl;
+            std::cout << "[" << nodeId << "] Received from " << peerNodeId << ": " << message << std::endl;
             
             // Process messages
             if (message.find("DISCOVER") == 0) {
@@ -268,8 +317,8 @@ public:
 
         std::cout << "[" << nodeId << "] Connected! Authenticating..." << std::endl;
 
-        // Send authentication
-        std::string authMsg = "AUTH:" + sha256(password);
+        // Send authentication with our node info
+        std::string authMsg = "AUTH:" + sha256(password) + ":" + nodeId + ":" + std::to_string(listenPort);
         send(peerSocket, authMsg.c_str(), authMsg.length(), 0);
 
         // Wait for response
@@ -291,23 +340,50 @@ public:
         
         std::string response(buffer, bytesReceived);
         
+        // Expected format: AUTH_OK:<peer_node_id>:<peer_listen_port>
         if (response.find("AUTH_OK") == 0) {
-            std::cout << "[" << nodeId << "] Authentication successful!" << std::endl;
+            size_t pos1 = 8;  // After "AUTH_OK:"
+            size_t pos2 = response.find(':', pos1);
             
-            std::lock_guard<std::mutex> lock(peersMutex);
-            Peer peer;
-            peer.address = address;
-            peer.port = port;
-            peer.socket = peerSocket;
-            peer.connected = true;
-            peer.authenticated = true;
-            peer.lastSeen = time(nullptr);
+            std::string peerNodeId;
+            int peerListenPort = port;  // Default to connection port
             
-            std::string peerId = address + ":" + std::to_string(port);
-            peers[peerId] = peer;
+            if (pos2 != std::string::npos) {
+                peerNodeId = response.substr(pos1, pos2 - pos1);
+                peerListenPort = std::stoi(response.substr(pos2 + 1));
+            } else {
+                peerNodeId = response.substr(pos1);
+            }
+            
+            std::cout << "[" << nodeId << "] Authentication successful with " << peerNodeId << "!" << std::endl;
+            
+            {
+                std::lock_guard<std::mutex> lock(peersMutex);
+                
+                // Check if we already have a connection to this peer
+                if (peers.find(peerNodeId) != peers.end() && peers[peerNodeId].connected) {
+                    std::cout << "[" << nodeId << "] Already have a connection to " << peerNodeId << std::endl;
+                    closesocket(peerSocket);
+                    return false;
+                }
+                
+                Peer peer;
+                peer.nodeId = peerNodeId;
+                peer.address = address;
+                peer.port = port;
+                peer.listenPort = peerListenPort;
+                peer.socket = peerSocket;
+                peer.connected = true;
+                peer.authenticated = true;
+                peer.lastSeen = time(nullptr);
+                
+                peers[peerNodeId] = peer;
+                std::cout << "[" << nodeId << "] Registered bidirectional peer: " << peerNodeId 
+                          << " (listening on " << peerListenPort << ")" << std::endl;
+            }
 
             // Start handling this peer in a separate thread
-            std::thread(&MeshNode::handlePeerConnection, this, peerSocket, address, true).detach();
+            std::thread(&MeshNode::handlePeerConnection, this, peerSocket, address, peerNodeId, true).detach();
 
             // Send discovery message
             std::string discoverMsg = "DISCOVER:" + nodeId;
@@ -342,7 +418,9 @@ public:
         } else {
             for (const auto& pair : peers) {
                 if (pair.second.connected && pair.second.authenticated) {
-                    std::cout << "  - " << pair.first << " [Authenticated]" << std::endl;
+                    std::cout << "  - " << pair.second.nodeId 
+                              << " (" << pair.second.address << ":" << pair.second.listenPort << ")"
+                              << " [Bidirectional]" << std::endl;
                 }
             }
         }
