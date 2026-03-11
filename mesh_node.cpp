@@ -39,7 +39,11 @@ private:
         bool connected;
         bool authenticated;
         time_t lastSeen;
+        time_t lastHeartbeat;
     };
+
+     const int HEARTBEAT_INTERVAL = 5;  // seconds
+     const int HEARTBEAT_TIMEOUT = 15;  // seconds
 
     int listenPort;
     SOCKET listenSocket;
@@ -212,6 +216,7 @@ private:
             peer.connected = true;
             peer.authenticated = true;
             peer.lastSeen = time(nullptr);
+            peer.lastHeartbeat = time(nullptr);
             
             peers[peerId] = peer;
             std::cout << "[" << nodeId << "] Registered bidirectional peer: " << peerNodeId 
@@ -225,11 +230,43 @@ private:
     void handlePeerConnection(SOCKET socket, const std::string& address, const std::string& peerNodeId, bool authenticated = false) {
         char buffer[1024];
         
+        // Set socket timeout for non-blocking reads
+        struct timeval tv;
+        tv.tv_sec = 1;  // 1 second timeout
+        tv.tv_usec = 0;
+        setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        
         while (running) {
             memset(buffer, 0, sizeof(buffer));
             int bytesReceived = recv(socket, buffer, sizeof(buffer) - 1, 0);
             
-            if (bytesReceived <= 0) {
+            if (bytesReceived > 0) {
+                std::string message(buffer, bytesReceived);
+                
+                // Update last seen time
+                {
+                    std::lock_guard<std::mutex> lock(peersMutex);
+                    if (peers.find(peerNodeId) != peers.end()) {
+                        peers[peerNodeId].lastSeen = time(nullptr);
+                    }
+                }
+                
+                // Process messages
+                if (message.find("HEARTBEAT") == 0) {
+                    // Update last heartbeat time
+                    std::lock_guard<std::mutex> lock(peersMutex);
+                    if (peers.find(peerNodeId) != peers.end()) {
+                        peers[peerNodeId].lastHeartbeat = time(nullptr);
+                    }
+                } else if (message.find("DISCOVER") == 0) {
+                    std::string response = "HELLO:" + nodeId;
+                    send(socket, response.c_str(), response.length(), 0);
+                } else {
+                    // Regular message
+                    std::cout << "[" << nodeId << "] Received from " << peerNodeId << ": " << message << std::endl;
+                }
+            } else if (bytesReceived == 0) {
+                // Connection closed by peer
                 std::cout << "[" << nodeId << "] Connection closed with " << peerNodeId << " (" << address << ")" << std::endl;
                 
                 // Mark peer as disconnected
@@ -239,18 +276,39 @@ private:
                 }
                 break;
             }
-            
-            std::string message(buffer, bytesReceived);
-            std::cout << "[" << nodeId << "] Received from " << peerNodeId << ": " << message << std::endl;
-            
-            // Process messages
-            if (message.find("DISCOVER") == 0) {
-                std::string response = "HELLO:" + nodeId;
-                send(socket, response.c_str(), response.length(), 0);
-            }
+            // If bytesReceived < 0, it's a timeout, continue loop
         }
         
         closesocket(socket);
+    }
+
+    void heartbeatThread() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+            
+            std::lock_guard<std::mutex> lock(peersMutex);
+            time_t now = time(nullptr);
+            
+            for (auto& pair : peers) {
+                if (pair.second.connected && pair.second.authenticated) {
+                    // Send heartbeat
+                    std::string heartbeat = "HEARTBEAT";
+                    int result = send(pair.second.socket, heartbeat.c_str(), heartbeat.length(), 0);
+                    
+                    if (result == SOCKET_ERROR) {
+                        std::cout << "[" << nodeId << "] Failed to send heartbeat to " << pair.second.nodeId << std::endl;
+                        pair.second.connected = false;
+                    }
+                    
+                    // Check if peer has timed out
+                    if (now - pair.second.lastHeartbeat > HEARTBEAT_TIMEOUT) {
+                        std::cout << "[" << nodeId << "] Peer " << pair.second.nodeId << " timed out" << std::endl;
+                        pair.second.connected = false;
+                        closesocket(pair.second.socket);
+                    }
+                }
+            }
+        }
     }
 
 public:
@@ -273,6 +331,9 @@ public:
         
         // Start accepting connections in a separate thread
         std::thread(&MeshNode::acceptConnections, this).detach();
+        
+        // Start heartbeat thread
+        std::thread(&MeshNode::heartbeatThread, this).detach();
     }
 
     void stop() {
@@ -376,6 +437,7 @@ public:
                 peer.connected = true;
                 peer.authenticated = true;
                 peer.lastSeen = time(nullptr);
+                peer.lastHeartbeat = time(nullptr);
                 
                 peers[peerNodeId] = peer;
                 std::cout << "[" << nodeId << "] Registered bidirectional peer: " << peerNodeId 
