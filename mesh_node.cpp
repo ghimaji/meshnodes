@@ -538,11 +538,8 @@ int main(int argc, char* argv[]) {
                     std::string ip = command.substr(8, space1 - 8);
                     int peerPort = std::stoi(command.substr(space1 + 1));
                     
-                    std::cout << "Enter password for peer: ";
-                    std::string peerPassword;
-                    std::getline(std::cin, peerPassword);
                     
-                    node.connectToPeer(ip, peerPort, peerPassword);
+                    node.connectToPeer(ip, peerPort, password);
                 } else {
                     std::cout << "Usage: connect <ip> <port>" << std::endl;
                 }
