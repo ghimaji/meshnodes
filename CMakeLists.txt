@@ -4,13 +4,19 @@ project(MeshNetwork)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+
 add_executable(mesh_node mesh_node.cpp)
+
+# Include OpenSSL headers
+target_include_directories(mesh_node PRIVATE ${OPENSSL_INCLUDE_DIR})
 
 # Platform-specific settings
 if(WIN32)
-    target_link_libraries(mesh_node ws2_32)
+    target_link_libraries(mesh_node ws2_32 OpenSSL::SSL OpenSSL::Crypto)
 else()
-    target_link_libraries(mesh_node pthread)
+    target_link_libraries(mesh_node pthread OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # Set output directory

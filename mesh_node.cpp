@@ -6,6 +6,8 @@
 #include <mutex>
 #include <chrono>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -23,6 +25,9 @@
     #define closesocket close
 #endif
 
+// Simple SHA-256 hash function for password verification
+#include <openssl/sha.h>
+
 class MeshNode {
 private:
     struct Peer {
@@ -30,6 +35,7 @@ private:
         int port;
         SOCKET socket;
         bool connected;
+        bool authenticated;
         time_t lastSeen;
     };
 
@@ -39,6 +45,7 @@ private:
     std::mutex peersMutex;
     bool running;
     std::string nodeId;
+    std::string passwordHash;
 
     void initSockets() {
 #ifdef _WIN32
@@ -53,6 +60,20 @@ private:
 #ifdef _WIN32
         WSACleanup();
 #endif
+    }
+
+    std::string sha256(const std::string& str) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_CTX sha256;
+        SHA256_Init(&sha256);
+        SHA256_Update(&sha256, str.c_str(), str.length());
+        SHA256_Final(hash, &sha256);
+        
+        std::stringstream ss;
+        for(int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+        }
+        return ss.str();
     }
 
     std::string generateNodeId() {
@@ -101,12 +122,64 @@ private:
                 
                 std::cout << "[" << nodeId << "] Incoming connection from " << peerAddr << ":" << peerPort << std::endl;
                 
-                std::thread(&MeshNode::handlePeerConnection, this, clientSocket, peerAddr).detach();
+                std::thread(&MeshNode::handleIncomingPeer, this, clientSocket, peerAddr).detach();
             }
         }
     }
 
-    void handlePeerConnection(SOCKET socket, const std::string& address) {
+    bool authenticatePeer(SOCKET socket) {
+        // Wait for AUTH message
+        char buffer[1024];
+        memset(buffer, 0, sizeof(buffer));
+        
+        // Set timeout for authentication
+        struct timeval tv;
+        tv.tv_sec = 10;  // 10 second timeout
+        tv.tv_usec = 0;
+        setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        
+        int bytesReceived = recv(socket, buffer, sizeof(buffer) - 1, 0);
+        
+        if (bytesReceived <= 0) {
+            std::cout << "[" << nodeId << "] Authentication timeout or connection closed" << std::endl;
+            return false;
+        }
+        
+        std::string message(buffer, bytesReceived);
+        
+        // Expected format: AUTH:<password_hash>
+        if (message.find("AUTH:") == 0) {
+            std::string receivedHash = message.substr(5);
+            
+            if (receivedHash == passwordHash) {
+                std::string response = "AUTH_OK:" + nodeId;
+                send(socket, response.c_str(), response.length(), 0);
+                std::cout << "[" << nodeId << "] Peer authenticated successfully" << std::endl;
+                return true;
+            } else {
+                std::string response = "AUTH_FAIL";
+                send(socket, response.c_str(), response.length(), 0);
+                std::cout << "[" << nodeId << "] Authentication failed - incorrect password" << std::endl;
+                return false;
+            }
+        }
+        
+        std::cout << "[" << nodeId << "] Invalid authentication message" << std::endl;
+        return false;
+    }
+
+    void handleIncomingPeer(SOCKET socket, const std::string& address) {
+        // Authenticate the peer first
+        if (!authenticatePeer(socket)) {
+            closesocket(socket);
+            return;
+        }
+        
+        // If authenticated, handle the connection normally
+        handlePeerConnection(socket, address, true);
+    }
+
+    void handlePeerConnection(SOCKET socket, const std::string& address, bool authenticated = false) {
         char buffer[1024];
         
         while (running) {
@@ -121,7 +194,7 @@ private:
             std::string message(buffer, bytesReceived);
             std::cout << "[" << nodeId << "] Received from " << address << ": " << message << std::endl;
             
-            // Echo back or process message
+            // Process messages
             if (message.find("DISCOVER") == 0) {
                 std::string response = "HELLO:" + nodeId;
                 send(socket, response.c_str(), response.length(), 0);
@@ -132,9 +205,12 @@ private:
     }
 
 public:
-    MeshNode(int port) : listenPort(port), running(false), listenSocket(INVALID_SOCKET) {
+    MeshNode(int port, const std::string& password) 
+        : listenPort(port), running(false), listenSocket(INVALID_SOCKET) {
         initSockets();
         nodeId = generateNodeId();
+        passwordHash = sha256(password);
+        std::cout << "[" << nodeId << "] Password set (hash: " << passwordHash.substr(0, 16) << "...)" << std::endl;
     }
 
     ~MeshNode() {
@@ -165,7 +241,7 @@ public:
         }
     }
 
-    bool connectToPeer(const std::string& address, int port) {
+    bool connectToPeer(const std::string& address, int port, const std::string& password) {
         SOCKET peerSocket = socket(AF_INET, SOCK_STREAM, 0);
         if (peerSocket == INVALID_SOCKET) {
             std::cerr << "Failed to create socket for peer connection" << std::endl;
@@ -190,27 +266,59 @@ public:
             return false;
         }
 
-        std::cout << "[" << nodeId << "] Connected to peer!" << std::endl;
+        std::cout << "[" << nodeId << "] Connected! Authenticating..." << std::endl;
 
-        std::lock_guard<std::mutex> lock(peersMutex);
-        Peer peer;
-        peer.address = address;
-        peer.port = port;
-        peer.socket = peerSocket;
-        peer.connected = true;
-        peer.lastSeen = time(nullptr);
+        // Send authentication
+        std::string authMsg = "AUTH:" + sha256(password);
+        send(peerSocket, authMsg.c_str(), authMsg.length(), 0);
+
+        // Wait for response
+        char buffer[1024];
+        memset(buffer, 0, sizeof(buffer));
         
-        std::string peerId = address + ":" + std::to_string(port);
-        peers[peerId] = peer;
+        struct timeval tv;
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        setsockopt(peerSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        
+        int bytesReceived = recv(peerSocket, buffer, sizeof(buffer) - 1, 0);
+        
+        if (bytesReceived <= 0) {
+            std::cerr << "Authentication timeout" << std::endl;
+            closesocket(peerSocket);
+            return false;
+        }
+        
+        std::string response(buffer, bytesReceived);
+        
+        if (response.find("AUTH_OK") == 0) {
+            std::cout << "[" << nodeId << "] Authentication successful!" << std::endl;
+            
+            std::lock_guard<std::mutex> lock(peersMutex);
+            Peer peer;
+            peer.address = address;
+            peer.port = port;
+            peer.socket = peerSocket;
+            peer.connected = true;
+            peer.authenticated = true;
+            peer.lastSeen = time(nullptr);
+            
+            std::string peerId = address + ":" + std::to_string(port);
+            peers[peerId] = peer;
 
-        // Start handling this peer in a separate thread
-        std::thread(&MeshNode::handlePeerConnection, this, peerSocket, address).detach();
+            // Start handling this peer in a separate thread
+            std::thread(&MeshNode::handlePeerConnection, this, peerSocket, address, true).detach();
 
-        // Send discovery message
-        std::string discoverMsg = "DISCOVER:" + nodeId;
-        send(peerSocket, discoverMsg.c_str(), discoverMsg.length(), 0);
+            // Send discovery message
+            std::string discoverMsg = "DISCOVER:" + nodeId;
+            send(peerSocket, discoverMsg.c_str(), discoverMsg.length(), 0);
 
-        return true;
+            return true;
+        } else {
+            std::cerr << "[" << nodeId << "] Authentication failed - incorrect password" << std::endl;
+            closesocket(peerSocket);
+            return false;
+        }
     }
 
     void broadcastMessage(const std::string& message) {
@@ -219,7 +327,7 @@ public:
         std::cout << "[" << nodeId << "] Broadcasting: " << message << std::endl;
         
         for (auto& pair : peers) {
-            if (pair.second.connected && pair.second.socket != INVALID_SOCKET) {
+            if (pair.second.connected && pair.second.authenticated && pair.second.socket != INVALID_SOCKET) {
                 send(pair.second.socket, message.c_str(), message.length(), 0);
             }
         }
@@ -233,8 +341,8 @@ public:
             std::cout << "No peers connected" << std::endl;
         } else {
             for (const auto& pair : peers) {
-                if (pair.second.connected) {
-                    std::cout << "  - " << pair.first << std::endl;
+                if (pair.second.connected && pair.second.authenticated) {
+                    std::cout << "  - " << pair.first << " [Authenticated]" << std::endl;
                 }
             }
         }
@@ -248,21 +356,31 @@ public:
 
 int main(int argc, char* argv[]) {
     int port = 8888;
+    std::string password;
     
     if (argc > 1) {
         port = std::atoi(argv[1]);
     }
 
-    std::cout << "=== Mesh Network Node ===" << std::endl;
+    std::cout << "=== Mesh Network Node (With Password Authentication) ===" << std::endl;
     std::cout << "Starting on port " << port << std::endl;
+    
+    // Get password
+    std::cout << "\nEnter network password: ";
+    std::getline(std::cin, password);
+    
+    if (password.empty()) {
+        std::cerr << "Password cannot be empty!" << std::endl;
+        return 1;
+    }
 
     try {
-        MeshNode node(port);
+        MeshNode node(port, password);
         node.start();
 
         std::cout << "\nNode ID: " << node.getNodeId() << std::endl;
         std::cout << "\nCommands:" << std::endl;
-        std::cout << "  connect <ip> <port> - Connect to a peer" << std::endl;
+        std::cout << "  connect <ip> <port> - Connect to a peer (will prompt for password)" << std::endl;
         std::cout << "  send <message>      - Broadcast message to all peers" << std::endl;
         std::cout << "  list                - List connected peers" << std::endl;
         std::cout << "  quit                - Exit program\n" << std::endl;
@@ -279,7 +397,12 @@ int main(int argc, char* argv[]) {
                 if (space1 != std::string::npos) {
                     std::string ip = command.substr(8, space1 - 8);
                     int peerPort = std::stoi(command.substr(space1 + 1));
-                    node.connectToPeer(ip, peerPort);
+                    
+                    std::cout << "Enter password for peer: ";
+                    std::string peerPassword;
+                    std::getline(std::cin, peerPassword);
+                    
+                    node.connectToPeer(ip, peerPort, peerPassword);
                 } else {
                     std::cout << "Usage: connect <ip> <port>" << std::endl;
                 }
